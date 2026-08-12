@@ -26,14 +26,57 @@ const stimuli: Record<number, Stimulus> = {
 };
 
 const makeStarterBank = (): Unit[] => unitNames.map((unit, index) => ({ unit, questions: [{ question: `What is one development from Unit ${index + 1}: ${unit} that could be used as evidence in an AP World History argument?`, answer: "", choices: [] }] }));
-const parseQuestions = (text: string): Question[] => text.split(/\r?\n-{10,}\r?\n\s*/).filter((block) => /^\d+\.\s/m.test(block)).map((block) => {
-  const numbered = block.slice(block.search(/^\d+\.\s/m));
-  const answer = numbered.match(/^\s*ANSWER:\s*([A-Z])\)/m)?.[1] ?? "";
-  const withoutAnswer = numbered.replace(/^\d+\.\s*/, "").replace(/^\s*ANSWER:\s*.+$/m, "");
-  const choicePattern = /^\s*([A-Z])\)\s*(.+)$/gm;
-  const first = choicePattern.exec(withoutAnswer); choicePattern.lastIndex = 0;
-  return { question: (first ? withoutAnswer.slice(0, first.index) : withoutAnswer).trim(), answer, choices: Array.from(withoutAnswer.matchAll(choicePattern), ([, label, choiceText]) => ({ label, text: choiceText.trim() })) };
-}).filter((item) => item.question);
+const parseQuestions = (text: string): Question[] => {
+  if (!text) return [];
+  // Split into blocks starting with a number and a dot
+  const parts = text.split(/(?=^\d+\.)/m).map(p => p.trim()).filter(Boolean);
+  const questions: Question[] = [];
+  for (const part of parts) {
+    // Ensure part starts with number
+    if (!/^\d+\./.test(part)) continue;
+    // Remove leading number
+    const body = part.replace(/^\d+\.\s*/, "");
+    // Try to find an ANSWER: line (formats: ANSWER: A or ANSWER: A) or ANSWER: A)
+    const answerMatch = body.match(/ANSWER:\s*([A-Z])/i);
+    const answer = answerMatch ? answerMatch[1].toUpperCase() : "";
+    // Remove any ANSWER line for parsing choices
+    const withoutAnswer = body.replace(/\r?\n?\s*ANSWER:\s*.+$/im, '').trim();
+    // Extract choices like 'A) text' or 'A. text' or '(A) text'
+    const choicePattern = /(?:^|\n)\s*\(?([A-D])\)?[\.)]?\s*([\s\S]*?)(?=(?:\n\s*\(?[A-D]\)?[\.)]?\s*)|$)/gm;
+    const choices: Choice[] = [];
+    let m: RegExpExecArray | null;
+    // If lines contain 'A)' style, use regex; otherwise try to detect by leading letters
+    if (/(^|\n)\s*\(?A\)?[\.)]?\s*/.test(withoutAnswer)) {
+      const regex = /(^|\n)\s*\(?([A-D])\)?[\.)]?\s*([\s\S]*?)(?=(?:\n\s*\(?[A-D]\)?[\.)]?\s*)|$)/gm;
+      while ((m = regex.exec(withoutAnswer)) !== null) {
+        const lbl = m[2]; const txt = (m[3] || '').trim();
+        if (lbl && txt) choices.push({ label: lbl, text: txt });
+      }
+    } else {
+      // Try line beginnings like 'A. Text' or 'A) Text'
+      const lines = withoutAnswer.split(/\r?\n/);
+      for (const line of lines) {
+        const lm = line.match(/^\s*([A-D])[\.)\)]?\s+(.+)$/);
+        if (lm) choices.push({ label: lm[1], text: lm[2].trim() });
+      }
+    }
+    // Determine question stem (text before first choice)
+    let questionText = withoutAnswer;
+    if (choices.length) {
+      const firstChoice = choices[0];
+      const idx = withoutAnswer.indexOf(firstChoice.text);
+      if (idx > 0) questionText = withoutAnswer.slice(0, idx).trim();
+      else {
+        const lines = withoutAnswer.split(/\r?\n/);
+        questionText = lines.slice(0, Math.max(0, lines.length - choices.length)).join(' ').trim();
+      }
+    }
+    // Remove any trailing choice label markers (e.g. "A)", "A.", "(A)") left on the stem
+    questionText = questionText.replace(/\s*\(?[A-D]\)?[\.)]?\s*$/,'').trim();
+    questions.push({ question: questionText, answer, choices });
+  }
+  return questions.filter(q => q.question && q.choices.length >= 3);
+};
 
 export default function Home() {
   const [bank, setBank] = useState<Unit[]>(makeStarterBank);
@@ -45,7 +88,23 @@ export default function Home() {
     if (typeof window === "undefined") return {};
     try { return JSON.parse(localStorage.getItem(progressStorageKey) ?? "{}"); } catch { return {}; }
   });
-  useEffect(() => { fetch("/questions/unit-1.txt").then((r) => r.text()).then((text) => { const questions = parseQuestions(text); if (questions.length) setBank((current) => current.map((item, i) => i === 0 ? { ...item, questions } : item)); }); }, []);
+  useEffect(() => {
+    // Try merged file first, then fallback to original
+    const paths = ['/questions/unit-1-merged.txt', '/questions/unit-1.txt'];
+    let tried = 0;
+    const tryNext = () => {
+      if (tried >= paths.length) return;
+      const p = paths[tried++];
+      fetch(p).then((r) => {
+        if (!r.ok) throw new Error('not found');
+        return r.text();
+      }).then((text) => {
+        const questions = parseQuestions(text);
+        if (questions.length) setBank((current) => current.map((item, i) => i === 0 ? { ...item, questions } : item));
+      }).catch(() => tryNext());
+    };
+    tryNext();
+  }, []);
   const saveProgress = (index: number, progress: UnitProgress) => setProgressByUnit((currentProgress) => { const nextProgress = { ...currentProgress, [index]: progress }; localStorage.setItem(progressStorageKey, JSON.stringify(nextProgress)); return nextProgress; });
   const openUnit = (index: number) => {
     if (index !== 0) return;
@@ -54,7 +113,16 @@ export default function Home() {
   };
   const goToQuestion = (index: number) => { setQuestionIndex(index); saveProgress(unitIndex, { questionIndex: index, answers, submittedQuestions }); };
   const current = bank[unitIndex].questions[questionIndex]; const questionNumber = questionIndex + 1;
-  const stimulus = stimuli[questionNumber - ((questionNumber - 1) % 3)];
+  // Compute stimulus key (start index for groups of 3). If missing, cycle through available stimuli keys.
+  const stimulusKeys = Object.keys(stimuli).map(k => parseInt(k, 10)).sort((a,b) => a-b);
+  const baseKey = questionNumber - ((questionNumber - 1) % 3);
+  const stimulus = ((): Stimulus | undefined => {
+    if (stimuli[baseKey]) return stimuli[baseKey];
+    if (!stimulusKeys.length) return undefined;
+    const groupIndex = Math.floor((questionNumber - 1) / 3);
+    const key = stimulusKeys[groupIndex % stimulusKeys.length];
+    return stimuli[key];
+  })();
   const totalQuestions = bank[unitIndex].questions.length;
   const selected = answers[questionIndex] ?? null;
   const submitted = submittedQuestions[questionIndex] ?? false;
